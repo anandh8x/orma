@@ -25,13 +25,22 @@ Orma runs entirely on your machine. It turns shell activity and agent tool runs 
 
 ## Install
 
-**Requirements:** Go 1.22+, Linux or macOS.
+**Requirements:** Linux or macOS. Go is optional if you use a release binary.
+
+### Install script (recommended)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/anandh8x/orma/main/scripts/install.sh | bash
+```
+
+Installs to `~/.local/bin/orma`. Pin a version with `ORMA_VERSION=v0.1.0`.
+
+### From source
 
 ```bash
 git clone https://github.com/anandh8x/orma.git
 cd orma
 make install
-# installs to ~/.local/bin/orma  (ensure that is on PATH)
 ```
 
 Or:
@@ -39,7 +48,6 @@ Or:
 ```bash
 go install github.com/anandh8x/orma/cmd/orma@latest
 ```
-
 ---
 
 ## Quick start
