@@ -1,6 +1,7 @@
 # Planning and agent notes (local only, never push)
 *.md
 !README.md
+!skills/**/*.md
 AGENTS.md
 docs/
 

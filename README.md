@@ -82,10 +82,31 @@ orma use boot --run         # type "yes" to execute all steps
 
 orma here                   # rituals for this git project
 orma last                   # most recent session
-orma context "reset postgres"   # markdown for pasting into an agent
+orma context "reset postgres"   # markdown runbook for agents
 ```
 
-Agents (optional):
+---
+
+## Coding agents
+
+Orma stores proven shell sequences so agents (and you) can **reuse** what already worked instead of rediscovering it every session.
+
+**Agent loop:**
+
+```bash
+# 1. Before exploring an ops/debug problem, load local memory
+orma context "reset postgres"
+orma recall docker
+
+# 2. Prefer those steps (adapt paths to the current cwd). If empty, explore.
+
+# 3. After you solve it, write it back so the next agent (or you) can reuse it
+orma save fix-db-reset
+orma distill --last --name fix-db-reset
+orma note "staging: always migrate before restart"
+```
+
+**Wire agents into capture (optional):**
 
 ```bash
 orma connect claude-code    # hook snippet + backfill ~/.claude
@@ -93,6 +114,15 @@ orma connect codex
 orma connect opencode
 orma daemon start           # watch agent logs + embed queue
 ```
+
+**Agent skill** (when/how to call Orma):
+
+```bash
+mkdir -p ~/.agents/skills/orma
+cp skills/orma/SKILL.md ~/.agents/skills/orma/SKILL.md
+```
+
+See [`skills/orma/SKILL.md`](skills/orma/SKILL.md).
 
 ---
 
