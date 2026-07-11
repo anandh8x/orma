@@ -8,20 +8,17 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"hash/fnv"
 	"math"
 	"os"
 	"path/filepath"
-	"strings"
-	"unicode"
 )
 
-const (
-	// ModelName is the local embedder id (hashing n-gram, MiniLM-compatible dim).
-	ModelName = "minilm-hash-v1"
-	// Dim matches common MiniLM embedding size for drop-in later.
-	Dim = 384
-)
+// Dim is MiniLM embedding size.
+const Dim = 384
+
+// ModelName is the preferred embeddings.model id when ONNX is active.
+// Kept for callers; prefer ActiveModelName(modelsDir).
+const ModelName = ONNXModelName
 
 // Embedder turns text into a fixed vector.
 type Embedder interface {
@@ -30,111 +27,100 @@ type Embedder interface {
 	Embed(ctx context.Context, text string) ([]float32, error)
 }
 
-// HashEmbedder is a local offline embedder (no ONNX runtime required).
-// Same dim as MiniLM so the store/daemon path matches the plan.
-type HashEmbedder struct{}
-
-func (HashEmbedder) Name() string { return ModelName }
-func (HashEmbedder) Dim() int     { return Dim }
-
-func (HashEmbedder) Embed(ctx context.Context, text string) ([]float32, error) {
-	_ = ctx
-	vec := make([]float32, Dim)
-	toks := tokens(text)
-	if len(toks) == 0 {
-		return vec, nil
-	}
-	for _, t := range toks {
-		h := fnv.New32a()
-		_, _ = h.Write([]byte(t))
-		idx := int(h.Sum32() % uint32(Dim))
-		vec[idx] += 1
-		h2 := fnv.New32a()
-		_, _ = h2.Write([]byte("s:" + t))
-		if h2.Sum32()%2 == 0 {
-			vec[idx] += 0.25
-		} else {
-			vec[idx] -= 0.25
-		}
-	}
-	var norm float64
-	for _, v := range vec {
-		norm += float64(v) * float64(v)
-	}
-	norm = math.Sqrt(norm)
-	if norm > 0 {
-		for i := range vec {
-			vec[i] = float32(float64(vec[i]) / norm)
-		}
-	}
-	return vec, nil
-}
-
-func tokens(s string) []string {
-	s = strings.ToLower(s)
-	var b strings.Builder
-	var out []string
-	flush := func() {
-		if b.Len() == 0 {
-			return
-		}
-		out = append(out, b.String())
-		b.Reset()
-	}
-	for _, r := range s {
-		if unicode.IsLetter(r) || unicode.IsDigit(r) {
-			b.WriteRune(r)
-		} else {
-			flush()
-		}
-	}
-	flush()
-	return out
-}
-
 // ModelMeta is written under data/models for init checks.
 type ModelMeta struct {
-	Name   string `json:"name"`
-	Dim    int    `json:"dim"`
-	SHA256 string `json:"sha256"`
-	Algo   string `json:"algo"`
+	Name      string `json:"name"`
+	Dim       int    `json:"dim"`
+	SHA256    string `json:"sha256"`
+	Algo      string `json:"algo"`
+	ModelURL  string `json:"model_url,omitempty"`
+	ORTReady  bool   `json:"ort_ready"`
+	ONNXReady bool   `json:"onnx_ready"`
 }
 
-// ExpectedSHA256 is the checksum of the canonical embedder identity.
-func ExpectedSHA256() string {
-	sum := sha256.Sum256([]byte(ModelName + "|hash-ngram|dim=384"))
-	return hex.EncodeToString(sum[:])
-}
-
-// EnsureModel writes models/embedder.json if missing or stale.
+// EnsureModel downloads MiniLM ONNX + vocab + ORT from the network (explicit only),
+// verifies checksums, and writes embedder.json. Falls back to hash meta if download fails
+// only when allowFallback is true via EnsureModelWithOptions.
 func EnsureModel(modelsDir string) (bool, error) {
+	return EnsureModelWithOptions(modelsDir, true)
+}
+
+// EnsureModelWithOptions controls fallback.
+func EnsureModelWithOptions(modelsDir string, allowFallback bool) (bool, error) {
 	if err := os.MkdirAll(modelsDir, 0o700); err != nil {
 		return false, err
 	}
-	path := filepath.Join(modelsDir, "embedder.json")
+
+	onnxOK := false
+	ortOK := false
+
+	// 1) model + vocab from Hugging Face
+	if err := DownloadFile(DefaultModelURL, ModelONNXPath(modelsDir), DefaultModelSHA256); err != nil {
+		if !allowFallback {
+			return false, fmt.Errorf("minilm onnx download: %w", err)
+		}
+	} else {
+		onnxOK = true
+	}
+	if err := DownloadFile(DefaultVocabURL, VocabPath(modelsDir), ""); err != nil {
+		if !allowFallback {
+			return false, fmt.Errorf("vocab download: %w", err)
+		}
+		onnxOK = false
+	}
+
+	// 2) ONNX Runtime shared lib
+	if _, err := EnsureORTLib(modelsDir); err != nil {
+		if !allowFallback {
+			return false, fmt.Errorf("onnxruntime download: %w", err)
+		}
+	} else {
+		ortOK = true
+	}
+
+	algo := "onnx-minilm-q"
+	name := ONNXModelName
+	sum := DefaultModelSHA256
+	if !onnxOK || !ortOK {
+		// hash fallback identity
+		algo = "hash-ngram-v1"
+		name = HashModelName
+		sum = hashIdentitySHA()
+		// still write hash-ready meta so product works offline after failed download
+		_ = writeHashReady(modelsDir)
+	}
+
 	meta := ModelMeta{
-		Name:   ModelName,
-		Dim:    Dim,
-		SHA256: ExpectedSHA256(),
-		Algo:   "hash-ngram-v1",
+		Name:      name,
+		Dim:       Dim,
+		SHA256:    sum,
+		Algo:      algo,
+		ModelURL:  DefaultModelURL,
+		ORTReady:  ortOK,
+		ONNXReady: onnxOK && ortOK,
 	}
 	raw, err := json.MarshalIndent(meta, "", "  ")
 	if err != nil {
 		return false, err
 	}
-	if existing, err := os.ReadFile(path); err == nil {
-		var got ModelMeta
-		if json.Unmarshal(existing, &got) == nil && got.SHA256 == ExpectedSHA256() && got.Name == ModelName {
-			return true, nil
-		}
-	}
+	path := filepath.Join(modelsDir, "embedder.json")
 	if err := os.WriteFile(path, raw, 0o600); err != nil {
 		return false, err
 	}
-	return true, nil
+	return meta.ONNXReady || name == HashModelName, nil
 }
 
-// ModelReady reports if embedder.json is present and checksum matches.
+func hashIdentitySHA() string {
+	sum := sha256.Sum256([]byte(HashModelName + "|hash-ngram|dim=384"))
+	return hex.EncodeToString(sum[:])
+}
+
+func writeHashReady(modelsDir string) error {
+	// nothing else required for hash
+	return nil
+}
+
+// ModelReady reports if embedder.json exists and is valid.
 func ModelReady(modelsDir string) bool {
 	path := filepath.Join(modelsDir, "embedder.json")
 	raw, err := os.ReadFile(path)
@@ -145,13 +131,63 @@ func ModelReady(modelsDir string) bool {
 	if json.Unmarshal(raw, &got) != nil {
 		return false
 	}
-	return got.SHA256 == ExpectedSHA256() && got.Name == ModelName
+	if got.Dim != Dim {
+		return false
+	}
+	if got.ONNXReady {
+		if _, err := os.Stat(ModelONNXPath(modelsDir)); err != nil {
+			return false
+		}
+		if _, err := os.Stat(VocabPath(modelsDir)); err != nil {
+			return false
+		}
+		return true
+	}
+	return got.Name == HashModelName && got.SHA256 == hashIdentitySHA()
+}
+
+// ONNXReady is true when MiniLM ONNX assets are present.
+func ONNXReady(modelsDir string) bool {
+	if _, err := os.Stat(ModelONNXPath(modelsDir)); err != nil {
+		return false
+	}
+	if _, err := os.Stat(VocabPath(modelsDir)); err != nil {
+		return false
+	}
+	if _, err := EnsureORTLib(modelsDir); err != nil {
+		return false
+	}
+	return true
+}
+
+// Open returns the best available embedder (ONNX MiniLM preferred).
+func Open(modelsDir string) (Embedder, error) {
+	if ONNXReady(modelsDir) {
+		m, err := NewMiniLMONNX(modelsDir)
+		if err == nil {
+			return m, nil
+		}
+		// fall through to hash if construct fails
+	}
+	return HashEmbedder{}, nil
+}
+
+// ActiveModelName returns which model id will be used for storage.
+func ActiveModelName(modelsDir string) string {
+	e, err := Open(modelsDir)
+	if err != nil {
+		return HashModelName
+	}
+	return e.Name()
 }
 
 // ModelsDir joins dataDir/models.
 func ModelsDir(dataDir string) string {
 	return filepath.Join(dataDir, "models")
 }
+
+// ExpectedSHA256 kept for older call sites (hash identity).
+func ExpectedSHA256() string { return hashIdentitySHA() }
 
 // Float32ToBytes packs little-endian floats.
 func Float32ToBytes(v []float32) []byte {
@@ -185,4 +221,16 @@ func SaveEmbedding(ctx context.Context, db *sql.DB, refType, refID, model string
 		id, refType, refID, model, len(vec), Float32ToBytes(vec),
 	)
 	return err
+}
+
+// EnsureReady downloads if needed and requires model ready.
+func EnsureReady(modelsDir string) error {
+	ok, err := EnsureModel(modelsDir)
+	if err != nil {
+		return err
+	}
+	if !ok || !ModelReady(modelsDir) {
+		return fmt.Errorf("embed model not ready in %s", modelsDir)
+	}
+	return nil
 }

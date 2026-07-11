@@ -116,6 +116,7 @@ func newInitCmd() *cobra.Command {
 
 			fmt.Println("init: ok")
 			fmt.Printf("binary: %s\n", exePath())
+			fmt.Printf("embedder: %s (onnx=%v)\n", embed.ActiveModelName(embed.ModelsDir(cfg.DataDir)), embed.ONNXReady(embed.ModelsDir(cfg.DataDir)))
 			fmt.Println("add one line to your shell rc, then open a new terminal:")
 			fmt.Println(`  eval "$(orma hook zsh)"`)
 			fmt.Println(`  # or: eval "$(orma hook bash)"`)
@@ -145,7 +146,9 @@ func newDoctorCmd() *cobra.Command {
 			fmt.Printf("db: %s\n", cfg.DBPath())
 			fmt.Printf("redact: %v\n", cfg.Redact)
 			fmt.Printf("session_idle: %s\n", cfg.SessionIdle.Duration)
-			fmt.Printf("model: %v\n", embed.ModelReady(embed.ModelsDir(cfg.DataDir)))
+			mdir := embed.ModelsDir(cfg.DataDir)
+			fmt.Printf("model_ready: %v\n", embed.ModelReady(mdir))
+			fmt.Printf("onnx: %v active=%s\n", embed.ONNXReady(mdir), embed.ActiveModelName(mdir))
 
 			running, pid, _ := daemon.Status(cfg.DataDir)
 			fmt.Printf("daemon: running=%v pid=%d\n", running, pid)
@@ -395,7 +398,7 @@ func newSaveCmd() *cobra.Command {
 				return err
 			}
 			// flush embeddings so recall is useful immediately
-			_, _ = embed.ProcessQueue(ctx, a.st.DB(), embed.HashEmbedder{}, 50)
+			_, _ = embed.ProcessQueue(ctx, a.st.DB(), a.embedder(), 50)
 			fmt.Printf("saved workflow %s (%d steps) id=%s\n", w.Name, len(w.Steps), w.ID)
 			return nil
 		},
@@ -909,7 +912,7 @@ func newDistillCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			_, _ = embed.ProcessQueue(ctx, a.st.DB(), embed.HashEmbedder{}, 50)
+			_, _ = embed.ProcessQueue(ctx, a.st.DB(), a.embedder(), 50)
 			fmt.Printf("distilled %s steps=%d id=%s\n", displayName(wf.Name, wf.ID), len(wf.Steps), wf.ID)
 			return nil
 		},
@@ -1174,16 +1177,22 @@ func newEmbedCmd() *cobra.Command {
 	root := &cobra.Command{Use: "embed", Short: "Embedding model helpers"}
 	root.AddCommand(&cobra.Command{
 		Use:   "ensure",
-		Short: "Ensure local embedder model file is present",
+		Short: "Download MiniLM ONNX + ORT from Hugging Face / GitHub if needed",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := config.Load()
 			if err != nil {
 				return err
 			}
+			fmt.Println("downloading MiniLM ONNX + onnxruntime if missing (network)...")
 			if err := embed.EnsureReady(embed.ModelsDir(cfg.DataDir)); err != nil {
 				return err
 			}
-			fmt.Println("model ready:", embed.ModelName)
+			e, err := embed.Open(embed.ModelsDir(cfg.DataDir))
+			if err != nil {
+				return err
+			}
+			fmt.Println("model ready:", e.Name())
+			fmt.Println("onnx:", embed.ONNXReady(embed.ModelsDir(cfg.DataDir)))
 			return nil
 		},
 	})
@@ -1202,17 +1211,17 @@ func newEmbedCmd() *cobra.Command {
 			ctx, cancel := withTimeout()
 			defer cancel()
 			pending, _ := embed.QueueStats(ctx, a.st.DB())
-			n, err := embed.ProcessQueue(ctx, a.st.DB(), embed.HashEmbedder{}, 500)
+			n, err := embed.ProcessQueue(ctx, a.st.DB(), a.embedder(), 500)
 			if err != nil {
 				return err
 			}
-			fmt.Printf("embedded %d (was pending %d)\n", n, pending)
+			fmt.Printf("embedded %d with %s (was pending %d)\n", n, a.embedder().Name(), pending)
 			return nil
 		},
 	})
 	root.AddCommand(&cobra.Command{
 		Use:   "status",
-		Short: "Show embed queue size",
+		Short: "Show embed queue and which model is active",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			a, err := openApp()
 			if err != nil {
@@ -1225,7 +1234,30 @@ func newEmbedCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			fmt.Printf("queue: %d  model: %v\n", n, embed.ModelReady(embed.ModelsDir(a.cfg.DataDir)))
+			dir := embed.ModelsDir(a.cfg.DataDir)
+			fmt.Printf("queue: %d\n", n)
+			fmt.Printf("ready: %v\n", embed.ModelReady(dir))
+			fmt.Printf("onnx_assets: %v\n", embed.ONNXReady(dir))
+			fmt.Printf("active: %s\n", embed.ActiveModelName(dir))
+			fmt.Printf("dir: %s\n", dir)
+			return nil
+		},
+	})
+	root.AddCommand(&cobra.Command{
+		Use:   "update",
+		Short: "Re-download MiniLM ONNX model (checksum verified)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := config.Load()
+			if err != nil {
+				return err
+			}
+			dir := embed.ModelsDir(cfg.DataDir)
+			_ = os.Remove(embed.ModelONNXPath(dir))
+			fmt.Println("re-downloading MiniLM from Hugging Face...")
+			if err := embed.EnsureReady(dir); err != nil {
+				return err
+			}
+			fmt.Println("updated:", embed.ActiveModelName(dir))
 			return nil
 		},
 	})

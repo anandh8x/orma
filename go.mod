@@ -8,6 +8,7 @@ require (
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/google/uuid v1.6.0
 	github.com/spf13/cobra v1.10.2
+	github.com/yalue/onnxruntime_go v1.31.0
 	modernc.org/sqlite v1.53.0
 )
 

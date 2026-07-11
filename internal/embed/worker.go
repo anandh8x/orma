@@ -8,6 +8,9 @@ import (
 
 // ProcessQueue embeds pending queue items. Returns how many were processed.
 func ProcessQueue(ctx context.Context, db *sql.DB, emb Embedder, limit int) (int, error) {
+	if emb == nil {
+		return 0, fmt.Errorf("nil embedder")
+	}
 	if limit <= 0 {
 		limit = 100
 	}
@@ -72,16 +75,4 @@ func QueueStats(ctx context.Context, db *sql.DB) (int, error) {
 	var n int
 	err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM embed_queue`).Scan(&n)
 	return n, err
-}
-
-// EnsureReady is a small helper for callers.
-func EnsureReady(modelsDir string) error {
-	ok, err := EnsureModel(modelsDir)
-	if err != nil {
-		return err
-	}
-	if !ok || !ModelReady(modelsDir) {
-		return fmt.Errorf("embed model not ready in %s", modelsDir)
-	}
-	return nil
 }

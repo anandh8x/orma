@@ -70,8 +70,11 @@ func Run(ctx context.Context, cfg *config.Config) error {
 
 	wf := &workflow.Service{Store: st}
 	dis := &distill.Service{Store: st, Workflow: wf}
-	emb := embed.HashEmbedder{}
 	_, _ = embed.EnsureModel(embed.ModelsDir(cfg.DataDir))
+	emb, _ := embed.Open(embed.ModelsDir(cfg.DataDir))
+	if emb == nil {
+		emb = embed.HashEmbedder{}
+	}
 
 	watchers := defaultWatchDirs()
 	seen := map[string]int64{}
@@ -84,6 +87,10 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
+			// refresh embedder if onnx assets appear later
+			if e, err := embed.Open(embed.ModelsDir(cfg.DataDir)); err == nil {
+				emb = e
+			}
 			_, _ = embed.ProcessQueue(ctx, st.DB(), emb, 50)
 			_, _ = dis.AutoDistillStale(ctx, 3*time.Minute)
 			for _, dir := range watchers {

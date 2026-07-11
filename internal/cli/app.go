@@ -49,10 +49,21 @@ func (a *app) distill() *distill.Service {
 func (a *app) runs() *runstate.Service { return &runstate.Service{Store: a.st} }
 func (a *app) recall() *recall.Service {
 	var emb embed.Embedder
+	var model string
 	if embed.ModelReady(embed.ModelsDir(a.cfg.DataDir)) {
-		emb = embed.HashEmbedder{}
+		if e, err := embed.Open(embed.ModelsDir(a.cfg.DataDir)); err == nil {
+			emb = e
+			model = e.Name()
+		}
 	}
-	return &recall.Service{Store: a.st, Embed: emb, Model: embed.ModelName}
+	return &recall.Service{Store: a.st, Embed: emb, Model: model}
+}
+
+func (a *app) embedder() embed.Embedder {
+	if e, err := embed.Open(embed.ModelsDir(a.cfg.DataDir)); err == nil {
+		return e
+	}
+	return embed.HashEmbedder{}
 }
 
 func withTimeout() (context.Context, context.CancelFunc) {
