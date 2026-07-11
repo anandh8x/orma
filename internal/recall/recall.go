@@ -13,14 +13,16 @@ import (
 
 // Hit is one recall result.
 type Hit struct {
-	RefType     string
-	RefID       string
-	Title       string
-	Body        string
-	ProjectRoot string
-	Score       float64
-	Pinned      bool
-	Origin      string
+	RefType      string
+	RefID        string
+	Title        string
+	Body         string
+	ProjectRoot  string
+	Score        float64
+	Pinned       bool
+	Origin       string
+	SuccessCount int
+	UseCount     int
 }
 
 // Service searches memory.
@@ -69,10 +71,11 @@ func (s *Service) Query(ctx context.Context, q, projectRoot string, limit int, r
 func (s *Service) likeSearch(ctx context.Context, q, projectRoot string, limit int) ([]Hit, error) {
 	like := "%" + q + "%"
 	rows, err := s.Store.DB().QueryContext(ctx, `
-		SELECT id, COALESCE(name,''), COALESCE(project_root,''), COALESCE(body,''), pinned, COALESCE(origin,'')
+		SELECT id, COALESCE(name,''), COALESCE(project_root,''), COALESCE(body,''), pinned, COALESCE(origin,''),
+		       success_count, use_count
 		FROM workflows
 		WHERE (name LIKE ? OR body LIKE ? OR id LIKE ?)
-		ORDER BY pinned DESC, updated_at DESC
+		ORDER BY pinned DESC, success_count DESC, use_count DESC, updated_at DESC
 		LIMIT ?`, like, like, like, limit)
 	if err != nil {
 		return nil, err
@@ -82,12 +85,12 @@ func (s *Service) likeSearch(ctx context.Context, q, projectRoot string, limit i
 	for rows.Next() {
 		var h Hit
 		var pinned int
-		if err := rows.Scan(&h.RefID, &h.Title, &h.ProjectRoot, &h.Body, &pinned, &h.Origin); err != nil {
+		if err := rows.Scan(&h.RefID, &h.Title, &h.ProjectRoot, &h.Body, &pinned, &h.Origin, &h.SuccessCount, &h.UseCount); err != nil {
 			return nil, err
 		}
 		h.RefType = "workflow"
 		h.Pinned = pinned == 1
-		h.Score = 3
+		h.Score = 3 + float64(h.SuccessCount)*0.5 + float64(h.UseCount)*0.1
 		if projectRoot != "" && h.ProjectRoot == projectRoot {
 			h.Score += 1
 		}
@@ -167,10 +170,11 @@ func (s *Service) ftsSearch(ctx context.Context, q string, limit int) ([]Hit, er
 
 func (s *Service) recent(ctx context.Context, projectRoot string, limit int) ([]Hit, error) {
 	rows, err := s.Store.DB().QueryContext(ctx, `
-		SELECT id, COALESCE(name,''), COALESCE(project_root,''), COALESCE(body,''), pinned, COALESCE(origin,'')
+		SELECT id, COALESCE(name,''), COALESCE(project_root,''), COALESCE(body,''), pinned, COALESCE(origin,''),
+		       success_count, use_count
 		FROM workflows
 		WHERE ? = '' OR project_root = ? OR project_root IS NULL
-		ORDER BY pinned DESC, updated_at DESC
+		ORDER BY pinned DESC, success_count DESC, updated_at DESC
 		LIMIT ?`, projectRoot, projectRoot, limit)
 	if err != nil {
 		return nil, err
@@ -180,12 +184,12 @@ func (s *Service) recent(ctx context.Context, projectRoot string, limit int) ([]
 	for rows.Next() {
 		var h Hit
 		var pinned int
-		if err := rows.Scan(&h.RefID, &h.Title, &h.ProjectRoot, &h.Body, &pinned, &h.Origin); err != nil {
+		if err := rows.Scan(&h.RefID, &h.Title, &h.ProjectRoot, &h.Body, &pinned, &h.Origin, &h.SuccessCount, &h.UseCount); err != nil {
 			return nil, err
 		}
 		h.RefType = "workflow"
 		h.Pinned = pinned == 1
-		h.Score = 1
+		h.Score = 1 + float64(h.SuccessCount)*0.5
 		hits = append(hits, h)
 	}
 	return hits, rows.Err()
@@ -240,10 +244,10 @@ func (s *Service) enrich(ctx context.Context, h *Hit) {
 	switch h.RefType {
 	case "workflow":
 		var name, project, body, origin sql.NullString
-		var pinned int
+		var pinned, success, use int
 		_ = s.Store.DB().QueryRowContext(ctx, `
-			SELECT name, project_root, body, pinned, origin FROM workflows WHERE id = ?`, h.RefID,
-		).Scan(&name, &project, &body, &pinned, &origin)
+			SELECT name, project_root, body, pinned, origin, success_count, use_count FROM workflows WHERE id = ?`, h.RefID,
+		).Scan(&name, &project, &body, &pinned, &origin, &success, &use)
 		if h.Title == "" {
 			h.Title = name.String
 		}
@@ -255,6 +259,8 @@ func (s *Service) enrich(ctx context.Context, h *Hit) {
 		}
 		h.Pinned = pinned == 1
 		h.Origin = origin.String
+		h.SuccessCount = success
+		h.UseCount = use
 	case "note":
 		var text, project sql.NullString
 		_ = s.Store.DB().QueryRowContext(ctx, `
@@ -279,6 +285,7 @@ func (s *Service) enrich(ctx context.Context, h *Hit) {
 }
 
 func rankHits(hits []Hit, projectRoot string) {
+	// Pin > same project > success rate > recency/score > human over agent
 	sort.SliceStable(hits, func(i, j int) bool {
 		a, b := hits[i], hits[j]
 		if a.Pinned != b.Pinned {
@@ -289,10 +296,16 @@ func rankHits(hits []Hit, projectRoot string) {
 		if aProj != bProj {
 			return aProj
 		}
-		if a.Score == b.Score && a.Origin != b.Origin {
+		if a.SuccessCount != b.SuccessCount {
+			return a.SuccessCount > b.SuccessCount
+		}
+		if a.Score != b.Score {
+			return a.Score > b.Score
+		}
+		if a.Origin != b.Origin {
 			return a.Origin != "agent"
 		}
-		return a.Score > b.Score
+		return a.UseCount > b.UseCount
 	})
 }
 

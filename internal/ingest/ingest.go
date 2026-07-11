@@ -200,7 +200,7 @@ func nullableJSON(b []byte) any {
 	return string(b)
 }
 
-// Optional redaction (off by default). Very small starter set.
+// Optional redaction (off by default). Patterns in redact.go.
 func applyRedact(ev *event.Event) {
 	if ev.Command != nil {
 		s := redactString(*ev.Command)
@@ -211,55 +211,7 @@ func applyRedact(ev *event.Event) {
 	ev.StderrExcerpt = redactString(ev.StderrExcerpt)
 }
 
-func redactString(s string) string {
-	// Keep this conservative; full patterns can grow later.
-	repl := []struct{ old, new string }{
-		// bearer tokens
-	}
-	_ = repl
-	// simple patterns via strings
-	out := s
-	out = redactKeyValue(out, "api_key")
-	out = redactKeyValue(out, "API_KEY")
-	out = redactKeyValue(out, "password")
-	out = redactKeyValue(out, "PASSWORD")
-	out = redactKeyValue(out, "token")
-	out = redactKeyValue(out, "TOKEN")
-	if strings.Contains(strings.ToLower(out), "authorization: bearer ") {
-		// crude
-		idx := strings.Index(strings.ToLower(out), "authorization: bearer ")
-		if idx >= 0 {
-			end := idx + len("authorization: bearer ")
-			out = out[:end] + "${REDACTED:bearer}"
-		}
-	}
-	return out
-}
-
 func fingerprint(s string) string {
 	sum := sha256.Sum256([]byte(strings.TrimSpace(s)))
 	return fmt.Sprintf("sha256:%x", sum[:16])
-}
-
-func redactKeyValue(s, key string) string {
-	// KEY=value or key=value
-	upper := s
-	for {
-		i := strings.Index(upper, key+"=")
-		if i < 0 {
-			break
-		}
-		start := i + len(key) + 1
-		end := start
-		for end < len(s) && s[end] != ' ' && s[end] != '\'' && s[end] != '"' && s[end] != '\n' {
-			end++
-		}
-		s = s[:start] + "${REDACTED:" + strings.ToLower(key) + "}" + s[end:]
-		upper = s
-		// prevent infinite loop
-		if !strings.Contains(s[start:], key+"=") {
-			break
-		}
-	}
-	return s
 }

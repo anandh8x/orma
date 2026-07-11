@@ -1,10 +1,16 @@
 package claude
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/anandh8x/orma/internal/config"
+	"github.com/anandh8x/orma/internal/daemon"
+	"github.com/anandh8x/orma/internal/ingest"
+	"github.com/anandh8x/orma/internal/store"
 )
 
 // Connect writes Claude Code hooks that call orma ingest on Bash tool use.
@@ -65,4 +71,32 @@ printf '%%s' "$payload" | %q ingest --json >/dev/null 2>&1 || true
 	}
 
 	return fmt.Sprintf("wrote %s and %s (merge snippet into Claude Code settings hooks)", hookScript, settingsPath), nil
+}
+
+// Backfill imports session/transcript files under ~/.claude.
+func Backfill(ctx context.Context, st *store.Store, cfg *config.Config) (int, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return 0, err
+	}
+	root := filepath.Join(home, ".claude")
+	if _, err := os.Stat(root); err != nil {
+		return 0, fmt.Errorf("claude dir not found: %s", root)
+	}
+	svc := &ingest.Service{Store: st, Config: cfg}
+	n := 0
+	_ = filepath.Walk(root, func(path string, fi os.FileInfo, err error) error {
+		if err != nil || fi == nil || fi.IsDir() {
+			return nil
+		}
+		ext := filepath.Ext(path)
+		if ext != ".jsonl" && ext != ".json" {
+			return nil
+		}
+		if err := daemon.ImportAgentFile(ctx, svc, path); err == nil {
+			n++
+		}
+		return nil
+	})
+	return n, nil
 }

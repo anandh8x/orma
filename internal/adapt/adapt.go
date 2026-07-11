@@ -2,6 +2,7 @@ package adapt
 
 import (
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -12,27 +13,55 @@ type Result struct {
 	Changed  bool
 }
 
-// Paths rewrites absolute paths that sit under oldProject to newProject / cwd.
+// Options controls rewriting.
+type Options struct {
+	OldProject string
+	NewProject string
+	CWD        string
+	// Aliases maps old host/path token -> new token (longest keys first).
+	Aliases map[string]string
+}
+
+// Paths rewrites project paths and optional aliases.
 func Paths(command, oldProject, newProject, cwd string) Result {
+	return Apply(command, Options{OldProject: oldProject, NewProject: newProject, CWD: cwd})
+}
+
+// Apply rewrites command using Options.
+func Apply(command string, opt Options) Result {
 	out := command
 	changed := false
 
-	if oldProject != "" && newProject != "" && oldProject != newProject {
-		if strings.Contains(out, oldProject) {
-			out = strings.ReplaceAll(out, oldProject, newProject)
+	if opt.OldProject != "" && opt.NewProject != "" && opt.OldProject != opt.NewProject {
+		if strings.Contains(out, opt.OldProject) {
+			out = strings.ReplaceAll(out, opt.OldProject, opt.NewProject)
 			changed = true
 		}
 	}
 
-	// Relative paths starting with ./ stay; if cwd differs and we have old project file refs, done above.
+	if len(opt.Aliases) > 0 {
+		// longest keys first to avoid partial replacements
+		keys := make([]string, 0, len(opt.Aliases))
+		for k := range opt.Aliases {
+			keys = append(keys, k)
+		}
+		sort.Slice(keys, func(i, j int) bool { return len(keys[i]) > len(keys[j]) })
+		for _, k := range keys {
+			if k == "" {
+				continue
+			}
+			v := opt.Aliases[k]
+			if strings.Contains(out, k) && k != v {
+				out = strings.ReplaceAll(out, k, v)
+				changed = true
+			}
+		}
+	}
 
-	// Rewrite home-style if new home differs: skip unless obvious
-	_ = cwd
-
-	// Normalize double slashes lightly
+	_ = opt.CWD
 	if strings.Contains(out, "//") && !strings.Contains(out, "://") {
-		out2 := filepath.Clean(out)
-		_ = out2
+		// only clean path-like segments carefully; skip full command clean
+		_ = filepath.Separator
 	}
 
 	return Result{Original: command, Adapted: out, Changed: changed || out != command}
@@ -55,6 +84,7 @@ func IsDestructive(cmd string) bool {
 		"kubectl delete", "drop database", "drop table",
 		"git push --force", "git reset --hard",
 		">/dev/sd", "wipefs", "chmod -r 777 /",
+		":(){", "fork bomb",
 	}
 	for _, p := range patterns {
 		if strings.Contains(c, p) {

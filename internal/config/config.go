@@ -15,15 +15,17 @@ const appName = "orma"
 
 // Config is the on-disk TOML config.
 type Config struct {
-	DataDir           string        `toml:"data_dir"`
-	SessionIdle       Duration      `toml:"session_idle"`
-	Redact            bool          `toml:"redact"`
-	BusyTimeoutMS     int           `toml:"busy_timeout_ms"`
-	StderrExcerptMax  int           `toml:"stderr_excerpt_max"`
-	NoiseCommands     []string      `toml:"noise_commands"`
-	IgnoreCWD         []string      `toml:"ignore_cwd"`
-	Keybind           string        `toml:"keybind"`
-	path              string        // config file path (not serialized)
+	DataDir          string            `toml:"data_dir"`
+	SessionIdle      Duration          `toml:"session_idle"`
+	Redact           bool              `toml:"redact"`
+	BusyTimeoutMS    int               `toml:"busy_timeout_ms"`
+	StderrExcerptMax int               `toml:"stderr_excerpt_max"`
+	NoiseCommands    []string          `toml:"noise_commands"`
+	IgnoreCWD        []string          `toml:"ignore_cwd"`
+	Keybind          string            `toml:"keybind"`
+	// Aliases rewrites tokens during adapt (hosts, paths, etc).
+	Aliases map[string]string `toml:"aliases"`
+	path    string            // config file path (not serialized)
 }
 
 // Duration wraps time.Duration for TOML strings like "20m".
@@ -66,6 +68,7 @@ func Default() (*Config, error) {
 		},
 		IgnoreCWD: nil,
 		Keybind:   "ctrl-g",
+		Aliases:   map[string]string{},
 	}, nil
 }
 
@@ -128,6 +131,9 @@ func LoadFrom(cfgPath string) (*Config, error) {
 	if cfg.NoiseCommands == nil {
 		def, _ := Default()
 		cfg.NoiseCommands = def.NoiseCommands
+	}
+	if cfg.Aliases == nil {
+		cfg.Aliases = map[string]string{}
 	}
 	return cfg, nil
 }

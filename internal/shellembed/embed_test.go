@@ -25,8 +25,18 @@ func TestScriptInjectsBinary(t *testing.T) {
 	}
 }
 
+func TestFishScript(t *testing.T) {
+	s, err := Script("fish", "/bin/orma")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(s, "/bin/orma") {
+		t.Fatal(s)
+	}
+}
+
 func TestBadShell(t *testing.T) {
-	if _, err := Script("fish", "orma"); err == nil {
+	if _, err := Script("xonsh", "orma"); err == nil {
 		t.Fatal("expected error")
 	}
 }

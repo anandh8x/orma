@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/anandh8x/orma/internal/agentparse"
 	"github.com/anandh8x/orma/internal/config"
 	"github.com/anandh8x/orma/internal/ingest"
 	"github.com/anandh8x/orma/internal/store"
@@ -28,7 +29,6 @@ func scanJSONLDir(ctx context.Context, st *store.Store, cfg *config.Config, dir 
 		if !strings.HasSuffix(path, ".jsonl") && !strings.HasSuffix(path, ".json") {
 			return nil
 		}
-		// skip huge files
 		if fi.Size() > 50*1024*1024 {
 			return nil
 		}
@@ -36,12 +36,11 @@ func scanJSONLDir(ctx context.Context, st *store.Store, cfg *config.Config, dir 
 		if prev, ok := seen[path]; ok && prev == mod {
 			return nil
 		}
-		// only process recently modified
 		if time.Since(fi.ModTime()) > 48*time.Hour && seen[path] != 0 {
 			seen[path] = mod
 			return nil
 		}
-		_ = importAgentFile(ctx, svc, path)
+		_ = ImportAgentFile(ctx, svc, path)
 		seen[path] = mod
 		return nil
 	})
@@ -49,56 +48,81 @@ func scanJSONLDir(ctx context.Context, st *store.Store, cfg *config.Config, dir 
 
 // ImportAgentFile parses a session json/jsonl file into events.
 func ImportAgentFile(ctx context.Context, svc *ingest.Service, path string) error {
-	return importAgentFile(ctx, svc, path)
-}
-
-func importAgentFile(ctx context.Context, svc *ingest.Service, path string) error {
 	f, err := os.Open(path)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
 
-	sc := bufio.NewScanner(f)
-	buf := make([]byte, 0, 64*1024)
-	sc.Buffer(buf, 2*1024*1024)
-
 	agent := detectAgent(path)
 	sessionID := filepath.Base(path)
+	// strip extension for cleaner session ids
+	sessionID = strings.TrimSuffix(sessionID, filepath.Ext(sessionID))
+
+	sc := bufio.NewScanner(f)
+	buf := make([]byte, 0, 64*1024)
+	sc.Buffer(buf, 4*1024*1024)
+
+	// json array file?
+	if strings.HasSuffix(path, ".json") {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		// try as single object or array
+		var arr []json.RawMessage
+		if json.Unmarshal(data, &arr) == nil {
+			for _, raw := range arr {
+				ingestParsed(ctx, svc, raw, agent, sessionID)
+			}
+			return nil
+		}
+		ingestParsed(ctx, svc, data, agent, sessionID)
+		return nil
+	}
 
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
 		if line == "" {
 			continue
 		}
-		cmd, ok := extractCommand(line)
-		if !ok || cmd == "" {
-			continue
+		ingestParsed(ctx, svc, []byte(line), agent, sessionID)
+	}
+	return sc.Err()
+}
+
+func ingestParsed(ctx context.Context, svc *ingest.Service, raw []byte, agent, fallbackSID string) {
+	for _, ce := range agentparse.ExtractCommands(raw, agent) {
+		sid := ce.SessionID
+		if sid == "" {
+			sid = fallbackSID
 		}
 		ev := map[string]any{
 			"schema":     "orma.event.v1",
-			"ts":         time.Now().UTC().Format(time.RFC3339Nano),
+			"ts":         ce.TS.UTC().Format(time.RFC3339Nano),
 			"actor":      "agent",
-			"agent":      agent,
+			"agent":      ce.Agent,
 			"kind":       "bash",
-			"source":     agent,
-			"command":    cmd,
-			"session_id": sessionID,
-			"outcome":    "unknown",
+			"source":     ce.Agent,
+			"command":    ce.Command,
+			"session_id": sid,
+			"tool":       ce.Tool,
+			"cwd":        ce.CWD,
 		}
-		// try exit from line
-		if strings.Contains(line, "\"exit_code\"") {
-			var raw map[string]any
-			if json.Unmarshal([]byte(line), &raw) == nil {
-				if v, ok := raw["exit_code"].(float64); ok {
-					ev["exit_code"] = int(v)
-				}
-			}
+		if ce.ParentID != "" {
+			ev["parent_session_id"] = ce.ParentID
+		}
+		if ce.Goal != "" {
+			ev["goal"] = ce.Goal
+		}
+		if ce.ExitCode != nil {
+			ev["exit_code"] = *ce.ExitCode
+		} else {
+			ev["outcome"] = "unknown"
 		}
 		b, _ := json.Marshal(ev)
 		_, _ = svc.IngestOne(ctx, b)
 	}
-	return sc.Err()
 }
 
 func detectAgent(path string) string {
@@ -113,40 +137,4 @@ func detectAgent(path string) string {
 	default:
 		return "generic"
 	}
-}
-
-func extractCommand(line string) (string, bool) {
-	var raw map[string]any
-	if err := json.Unmarshal([]byte(line), &raw); err != nil {
-		return "", false
-	}
-	// common shapes
-	if c, ok := asString(raw["command"]); ok {
-		return c, true
-	}
-	if c, ok := asString(raw["cmd"]); ok {
-		return c, true
-	}
-	if ti, ok := raw["tool_input"].(map[string]any); ok {
-		if c, ok := asString(ti["command"]); ok {
-			return c, true
-		}
-	}
-	if ti, ok := raw["input"].(map[string]any); ok {
-		if c, ok := asString(ti["command"]); ok {
-			return c, true
-		}
-	}
-	// nested message content
-	if msg, ok := raw["message"].(map[string]any); ok {
-		if c, ok := asString(msg["command"]); ok {
-			return c, true
-		}
-	}
-	return "", false
-}
-
-func asString(v any) (string, bool) {
-	s, ok := v.(string)
-	return s, ok && s != ""
 }

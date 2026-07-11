@@ -89,8 +89,13 @@ func (s *Service) DistillSession(ctx context.Context, sessionID, name string) (*
 	// Link fixes for earlier fail fingerprints if session ended with a success step.
 	if hasSuccess(steps) {
 		for _, fp := range unique(failFPs) {
-			_ = s.upsertFix(ctx, fp, w.ID, sessionID)
+			if id, err := s.upsertFix(ctx, fp, w.ID, sessionID); err == nil && id != "" {
+				_ = s.Store.UpsertFTS(ctx, "fix", id, project, "fix", fp+" "+w.ID)
+			}
 		}
+		// success_count bump on distilled successful workflows
+		_, _ = s.Store.DB().ExecContext(ctx, `
+			UPDATE workflows SET success_count = success_count + 1 WHERE id = ?`, w.ID)
 	}
 
 	// Mark session closed/success
@@ -149,7 +154,7 @@ func (s *Service) AutoDistillStale(ctx context.Context, olderThan time.Duration)
 	return n, nil
 }
 
-func (s *Service) upsertFix(ctx context.Context, fp, workflowID, sessionID string) error {
+func (s *Service) upsertFix(ctx context.Context, fp, workflowID, sessionID string) (string, error) {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	var id string
 	err := s.Store.DB().QueryRowContext(ctx, `
@@ -161,15 +166,15 @@ func (s *Service) upsertFix(ctx context.Context, fp, workflowID, sessionID strin
 			VALUES (?,?,?,?,1,?,?)`,
 			id, fp, workflowID, sessionID, now, now,
 		)
-		return err
+		return id, err
 	}
 	if err != nil {
-		return err
+		return "", err
 	}
 	_, err = s.Store.DB().ExecContext(ctx, `
 		UPDATE fixes SET resolution_workflow_id = ?, examples_count = examples_count + 1, updated_at = ?
 		WHERE id = ?`, workflowID, now, id)
-	return err
+	return id, err
 }
 
 func compressSteps(steps []workflow.Step) []workflow.Step {

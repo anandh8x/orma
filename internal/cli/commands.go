@@ -22,11 +22,13 @@ import (
 	"github.com/anandh8x/orma/internal/daemon"
 	"github.com/anandh8x/orma/internal/embed"
 	"github.com/anandh8x/orma/internal/event"
+	"github.com/anandh8x/orma/internal/fix"
 	"github.com/anandh8x/orma/internal/history"
 	"github.com/anandh8x/orma/internal/ingest"
 	"github.com/anandh8x/orma/internal/picker"
 	"github.com/anandh8x/orma/internal/project"
 	"github.com/anandh8x/orma/internal/recall"
+	"github.com/anandh8x/orma/internal/runexec"
 	"github.com/anandh8x/orma/internal/shellembed"
 	"github.com/anandh8x/orma/internal/store"
 	"github.com/anandh8x/orma/internal/workflow"
@@ -58,6 +60,7 @@ func registerAll(root *cobra.Command) {
 	root.AddCommand(newPurgeCmd())
 	root.AddCommand(newEmbedCmd())
 	root.AddCommand(newWorkflowCmd())
+	root.AddCommand(newFixCmd())
 }
 
 func newInitCmd() *cobra.Command {
@@ -603,8 +606,25 @@ func emitPick(ctx context.Context, a *app, refType, refID string) error {
 			return nil
 		}
 		_, _ = a.runs().Start(ctx, w.ID)
-		r := adapt.Paths(w.Steps[0].Command, w.ProjectRoot, project.Resolve(cwd()), cwd())
+		r := adapt.Apply(w.Steps[0].Command, adapt.Options{
+			OldProject: w.ProjectRoot,
+			NewProject: project.Resolve(cwd()),
+			CWD:        cwd(),
+			Aliases:    a.cfg.Aliases,
+		})
 		fmt.Print(r.Adapted)
+		return nil
+	}
+	if refType == "fix" {
+		fs := &fix.Service{Store: a.st}
+		rec, err := fs.Get(ctx, refID)
+		if err != nil {
+			return err
+		}
+		if rec.ResolutionWorkflowID != "" {
+			return emitPick(ctx, a, "workflow", rec.ResolutionWorkflowID)
+		}
+		fmt.Print(rec.ErrorFingerprint)
 		return nil
 	}
 	var body string
@@ -720,9 +740,17 @@ func newUseCmd() *cobra.Command {
 				return err
 			}
 			proj := project.Resolve(cwd())
+			opt := adapt.Options{
+				OldProject: w.ProjectRoot,
+				NewProject: proj,
+				CWD:        cwd(),
+				Aliases:    a.cfg.Aliases,
+			}
 			fmt.Printf("workflow: %s (%d steps) origin=%s\n", displayName(w.Name, w.ID), len(w.Steps), w.Origin)
+			adapted := make([]string, 0, len(w.Steps))
 			for i, st := range w.Steps {
-				r := adapt.Paths(st.Command, w.ProjectRoot, proj, cwd())
+				r := adapt.Apply(st.Command, opt)
+				adapted = append(adapted, r.Adapted)
 				mark := " "
 				if r.Changed {
 					mark = "~"
@@ -737,33 +765,31 @@ func newUseCmd() *cobra.Command {
 				}
 			}
 			if run {
-				fmt.Print("run all steps? type yes: ")
-				sc := bufio.NewScanner(os.Stdin)
-				if !sc.Scan() || strings.TrimSpace(sc.Text()) != "yes" {
-					fmt.Println("aborted")
-					return nil
+				if err := runexec.RunSteps(ctx, adapted, true); err != nil {
+					return err
 				}
-				for _, st := range w.Steps {
-					r := adapt.Paths(st.Command, w.ProjectRoot, proj, cwd())
-					fmt.Println("run:", r.Adapted)
-					// we only print; real exec would be shell's job
-				}
+				_, _ = a.st.DB().ExecContext(ctx, `
+					UPDATE workflows SET use_count = use_count + 1, last_used_at = ?, success_count = success_count + 1
+					WHERE id = ?`, time.Now().UTC().Format(time.RFC3339Nano), w.ID)
+				fmt.Println("run complete")
 				return nil
 			}
 			_, _ = a.runs().Start(ctx, w.ID)
-			if len(w.Steps) > 0 {
-				r := adapt.Paths(w.Steps[0].Command, w.ProjectRoot, proj, cwd())
+			_, _ = a.st.DB().ExecContext(ctx, `
+				UPDATE workflows SET use_count = use_count + 1, last_used_at = ? WHERE id = ?`,
+				time.Now().UTC().Format(time.RFC3339Nano), w.ID)
+			if len(adapted) > 0 {
 				if copyFlag {
-					clipboard.CopyOrPrint(r.Adapted)
+					clipboard.CopyOrPrint(adapted[0])
 				} else {
 					fmt.Println("--- step 1 (paste/run, then orma next) ---")
-					fmt.Println(r.Adapted)
+					fmt.Println(adapted[0])
 				}
 			}
 			return nil
 		},
 	}
-	cmd.Flags().BoolVar(&run, "run", false, "confirm and list steps for manual/exec run")
+	cmd.Flags().BoolVar(&run, "run", false, "execute all steps after typing yes (stops on failure)")
 	cmd.Flags().BoolVar(&copyFlag, "copy", false, "copy first step to clipboard")
 	return cmd
 }
@@ -844,7 +870,12 @@ func printStep(ctx context.Context, a *app, workflowID string, idx int) error {
 		return nil
 	}
 	proj := project.Resolve(cwd())
-	r := adapt.Paths(w.Steps[idx].Command, w.ProjectRoot, proj, cwd())
+	r := adapt.Apply(w.Steps[idx].Command, adapt.Options{
+		OldProject: w.ProjectRoot,
+		NewProject: proj,
+		CWD:        cwd(),
+		Aliases:    a.cfg.Aliases,
+	})
 	if adapt.IsDestructive(r.Adapted) {
 		fmt.Println("warning: destructive command")
 	}
@@ -1012,7 +1043,13 @@ func newConnectCmd() *cobra.Command {
 					return err
 				}
 				fmt.Println(msg)
-				fmt.Println("daemon will watch ~/.claude when running")
+				n, err := claude.Backfill(ctx, a.st, a.cfg)
+				if err != nil {
+					fmt.Println("backfill:", err.Error())
+				} else {
+					fmt.Printf("backfill scanned %d files\n", n)
+				}
+				_ = startDaemonBackground(a.cfg)
 			case "codex":
 				n, err := codex.Backfill(ctx, a.st, a.cfg)
 				if err != nil {
@@ -1035,6 +1072,68 @@ func newConnectCmd() *cobra.Command {
 			return nil
 		},
 	}
+}
+
+func newFixCmd() *cobra.Command {
+	root := &cobra.Command{Use: "fix", Short: "Browse error→fix memory"}
+	root.AddCommand(&cobra.Command{
+		Use:   "list",
+		Short: "List known fixes",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			a, err := openApp()
+			if err != nil {
+				return err
+			}
+			defer a.close()
+			ctx, cancel := withTimeout()
+			defer cancel()
+			list, err := (&fix.Service{Store: a.st}).List(ctx, 50)
+			if err != nil {
+				return err
+			}
+			for _, r := range list {
+				fmt.Println(fix.FormatHuman(r))
+			}
+			return nil
+		},
+	})
+	root.AddCommand(&cobra.Command{
+		Use:   "show <id-or-fingerprint-prefix>",
+		Short: "Show a fix and its resolution workflow",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			a, err := openApp()
+			if err != nil {
+				return err
+			}
+			defer a.close()
+			ctx, cancel := withTimeout()
+			defer cancel()
+			fs := &fix.Service{Store: a.st}
+			list, err := fs.List(ctx, 200)
+			if err != nil {
+				return err
+			}
+			q := args[0]
+			for _, r := range list {
+				if r.ID == q || strings.HasPrefix(r.ErrorFingerprint, q) || strings.Contains(r.ErrorFingerprint, q) {
+					fmt.Printf("id: %s\nfp: %s\nworkflow: %s\nexamples: %d\nupdated: %s\n",
+						r.ID, r.ErrorFingerprint, r.ResolutionWorkflowID, r.ExamplesCount, r.UpdatedAt)
+					if r.ResolutionWorkflowID != "" {
+						w, err := a.wf().Get(ctx, r.ResolutionWorkflowID)
+						if err == nil {
+							for i, st := range w.Steps {
+								fmt.Printf("%2d. [%s] %s\n", i+1, st.Outcome, st.Command)
+							}
+						}
+					}
+					return nil
+				}
+			}
+			return fmt.Errorf("fix not found")
+		},
+	})
+	return root
 }
 
 func newPurgeCmd() *cobra.Command {

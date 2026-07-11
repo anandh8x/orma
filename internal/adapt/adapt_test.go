@@ -25,3 +25,12 @@ func TestDestructive(t *testing.T) {
 		t.Fatal("ls not destructive")
 	}
 }
+
+func TestAliases(t *testing.T) {
+	r := Apply("ssh user@192.168.1.10", Options{
+		Aliases: map[string]string{"192.168.1.10": "10.0.0.5"},
+	})
+	if !r.Changed || r.Adapted != "ssh user@10.0.0.5" {
+		t.Fatalf("%+v", r)
+	}
+}
