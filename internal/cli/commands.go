@@ -18,12 +18,15 @@ import (
 	"github.com/anandh8x/orma/internal/adapters/opencode"
 	"github.com/anandh8x/orma/internal/clipboard"
 	"github.com/anandh8x/orma/internal/config"
+	"github.com/anandh8x/orma/internal/contextx"
 	"github.com/anandh8x/orma/internal/daemon"
 	"github.com/anandh8x/orma/internal/embed"
 	"github.com/anandh8x/orma/internal/event"
 	"github.com/anandh8x/orma/internal/history"
 	"github.com/anandh8x/orma/internal/ingest"
+	"github.com/anandh8x/orma/internal/picker"
 	"github.com/anandh8x/orma/internal/project"
+	"github.com/anandh8x/orma/internal/recall"
 	"github.com/anandh8x/orma/internal/shellembed"
 	"github.com/anandh8x/orma/internal/store"
 	"github.com/anandh8x/orma/internal/workflow"
@@ -44,7 +47,9 @@ func registerAll(root *cobra.Command) {
 	root.AddCommand(newPinCmd())
 	root.AddCommand(newHereCmd())
 	root.AddCommand(newSessionsCmd())
+	root.AddCommand(newLastCmd())
 	root.AddCommand(newRecallCmd())
+	root.AddCommand(newContextCmd())
 	root.AddCommand(newUseCmd())
 	root.AddCommand(newNextCmd())
 	root.AddCommand(newDistillCmd())
@@ -336,13 +341,10 @@ func newHookExitCmd() *cobra.Command {
 
 func newImportCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "import history",
-		Short: "Import shell history into memory",
+		Use:   "import [history|atuin]",
+		Short: "Import shell history or Atuin DB into memory",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if args[0] != "history" {
-				return fmt.Errorf("usage: orma import history")
-			}
 			a, err := openApp()
 			if err != nil {
 				return err
@@ -350,11 +352,22 @@ func newImportCmd() *cobra.Command {
 			defer a.close()
 			ctx, cancel := withTimeout()
 			defer cancel()
-			n, err := history.ImportShellHist(ctx, a.st, a.cfg, 0)
-			if err != nil {
-				return err
+			switch args[0] {
+			case "history":
+				n, err := history.ImportShellHist(ctx, a.st, a.cfg, 0)
+				if err != nil {
+					return err
+				}
+				fmt.Printf("imported %d events\n", n)
+			case "atuin":
+				n, err := history.ImportAtuin(ctx, a.st, a.cfg, "", 0)
+				if err != nil {
+					return err
+				}
+				fmt.Printf("imported %d events from atuin\n", n)
+			default:
+				return fmt.Errorf("usage: orma import history|atuin")
 			}
-			fmt.Printf("imported %d events\n", n)
 			return nil
 		},
 	}
@@ -378,6 +391,8 @@ func newSaveCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			// flush embeddings so recall is useful immediately
+			_, _ = embed.ProcessQueue(ctx, a.st.DB(), embed.HashEmbedder{}, 50)
 			fmt.Printf("saved workflow %s (%d steps) id=%s\n", w.Name, len(w.Steps), w.ID)
 			return nil
 		},
@@ -508,48 +523,32 @@ func newRecallCmd() *cobra.Command {
 				return err
 			}
 			if pick {
-				// simple numbered pick for shell widget (no full TUI dependency failure)
 				if len(hits) == 0 {
 					return nil
 				}
-				for i, h := range hits {
+				items := make([]picker.Item, 0, len(hits))
+				for _, h := range hits {
 					title := h.Title
 					if title == "" {
 						title = h.RefID
 					}
-					fmt.Fprintf(os.Stderr, "%d) [%s] %s\n", i+1, h.RefType, title)
-					if h.Body != "" {
-						line := strings.Split(h.Body, "\n")[0]
-						fmt.Fprintf(os.Stderr, "   %s\n", truncate(line, 80))
-					}
+					detail := strings.Split(h.Body, "\n")[0]
+					items = append(items, picker.Item{
+						Label:  fmt.Sprintf("[%s] %s", h.RefType, title),
+						Detail: detail,
+						Value:  h.RefType + "\x1e" + h.RefID,
+					})
 				}
-				fmt.Fprint(os.Stderr, "pick #: ")
-				sc := bufio.NewScanner(os.Stdin)
-				if !sc.Scan() {
+				val, err := picker.Run("orma recall", items)
+				if err != nil || val == "" {
+					// non-TTY fallback: numbered pick on stderr
+					return numberedPick(ctx, a, hits)
+				}
+				parts := strings.SplitN(val, "\x1e", 2)
+				if len(parts) != 2 {
 					return nil
 				}
-				n, _ := strconv.Atoi(strings.TrimSpace(sc.Text()))
-				if n < 1 || n > len(hits) {
-					return nil
-				}
-				h := hits[n-1]
-				if h.RefType == "workflow" {
-					w, err := a.wf().Get(ctx, h.RefID)
-					if err != nil {
-						return err
-					}
-					if len(w.Steps) == 0 {
-						return nil
-					}
-					// start run and print first adapted step
-					_, _ = a.runs().Start(ctx, w.ID)
-					cmdStr := w.Steps[0].Command
-					res := adapt.Paths(cmdStr, w.ProjectRoot, project.Resolve(cwd()), cwd())
-					fmt.Print(res.Adapted)
-					return nil
-				}
-				fmt.Print(strings.Split(h.Body, "\n")[0])
-				return nil
+				return emitPick(ctx, a, parts[0], parts[1])
 			}
 			for _, h := range hits {
 				pin := " "
@@ -568,6 +567,136 @@ func newRecallCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&pick, "pick", false, "interactive pick; print command for shell insert")
 	cmd.Flags().BoolVar(&raw, "raw", false, "include raw-ish hits")
 	return cmd
+}
+
+func numberedPick(ctx context.Context, a *app, hits []recall.Hit) error {
+	for i, h := range hits {
+		title := h.Title
+		if title == "" {
+			title = h.RefID
+		}
+		fmt.Fprintf(os.Stderr, "%d) [%s] %s\n", i+1, h.RefType, title)
+		if h.Body != "" {
+			fmt.Fprintf(os.Stderr, "   %s\n", truncate(strings.Split(h.Body, "\n")[0], 80))
+		}
+	}
+	fmt.Fprint(os.Stderr, "pick #: ")
+	sc := bufio.NewScanner(os.Stdin)
+	if !sc.Scan() {
+		return nil
+	}
+	n, _ := strconv.Atoi(strings.TrimSpace(sc.Text()))
+	if n < 1 || n > len(hits) {
+		return nil
+	}
+	h := hits[n-1]
+	return emitPick(ctx, a, h.RefType, h.RefID)
+}
+
+func emitPick(ctx context.Context, a *app, refType, refID string) error {
+	if refType == "workflow" {
+		w, err := a.wf().Get(ctx, refID)
+		if err != nil {
+			return err
+		}
+		if len(w.Steps) == 0 {
+			return nil
+		}
+		_, _ = a.runs().Start(ctx, w.ID)
+		r := adapt.Paths(w.Steps[0].Command, w.ProjectRoot, project.Resolve(cwd()), cwd())
+		fmt.Print(r.Adapted)
+		return nil
+	}
+	var body string
+	switch refType {
+	case "note":
+		_ = a.st.DB().QueryRowContext(ctx, `SELECT text FROM notes WHERE id = ?`, refID).Scan(&body)
+	default:
+		body = refID
+	}
+	if body != "" {
+		fmt.Print(strings.Split(body, "\n")[0])
+	}
+	return nil
+}
+
+func newLastCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "last",
+		Short: "Show the most recent session and its commands",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			a, err := openApp()
+			if err != nil {
+				return err
+			}
+			defer a.close()
+			var id, mix, agent, proj, status, last string
+			err = a.st.DB().QueryRow(`
+				SELECT id, actor_mix, COALESCE(agent,''), COALESCE(project_root,''), status, last_event_at
+				FROM sessions ORDER BY last_event_at DESC LIMIT 1`).Scan(&id, &mix, &agent, &proj, &status, &last)
+			if err != nil {
+				return fmt.Errorf("no sessions yet")
+			}
+			fmt.Printf("session %s  %s  %s  %s  %s\n", id, mix, agent, status, last)
+			if proj != "" {
+				fmt.Printf("project %s\n", proj)
+			}
+			rows, err := a.st.DB().Query(`
+				SELECT COALESCE(command,''), COALESCE(outcome,''), COALESCE(exit_code,-999)
+				FROM events WHERE session_id = ? AND command IS NOT NULL
+				ORDER BY ts ASC LIMIT 50`, id)
+			if err != nil {
+				return err
+			}
+			defer rows.Close()
+			i := 1
+			for rows.Next() {
+				var cmd, outcome string
+				var exit int
+				if err := rows.Scan(&cmd, &outcome, &exit); err != nil {
+					return err
+				}
+				mark := outcome
+				if exit != -999 && mark == "" {
+					if exit == 0 {
+						mark = "ok"
+					} else {
+						mark = "fail"
+					}
+				}
+				fmt.Printf("%2d. [%s] %s\n", i, mark, cmd)
+				i++
+			}
+			return rows.Err()
+		},
+	}
+}
+
+func newContextCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "context [query]",
+		Short: "Print a markdown runbook for pasting into coding agents",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			a, err := openApp()
+			if err != nil {
+				return err
+			}
+			defer a.close()
+			ctx, cancel := withTimeout()
+			defer cancel()
+			svc := &contextx.Service{
+				Store:  a.st,
+				Recall: a.recall(),
+				WF:     a.wf(),
+			}
+			out, err := svc.Build(ctx, strings.Join(args, " "), cwd(), 5)
+			if err != nil {
+				return err
+			}
+			fmt.Print(out)
+			return nil
+		},
+	}
 }
 
 func newUseCmd() *cobra.Command {
@@ -740,18 +869,16 @@ func newDistillCmd() *cobra.Command {
 			defer cancel()
 			var w interface{ GetID() string }
 			_ = w
+			var wf *workflow.Workflow
 			if last || len(args) == 0 {
-				wf, err := a.distill().DistillLast(ctx, name)
-				if err != nil {
-					return err
-				}
-				fmt.Printf("distilled %s steps=%d id=%s\n", displayName(wf.Name, wf.ID), len(wf.Steps), wf.ID)
-				return nil
+				wf, err = a.distill().DistillLast(ctx, name)
+			} else {
+				wf, err = a.distill().DistillSession(ctx, args[0], name)
 			}
-			wf, err := a.distill().DistillSession(ctx, args[0], name)
 			if err != nil {
 				return err
 			}
+			_, _ = embed.ProcessQueue(ctx, a.st.DB(), embed.HashEmbedder{}, 50)
 			fmt.Printf("distilled %s steps=%d id=%s\n", displayName(wf.Name, wf.ID), len(wf.Steps), wf.ID)
 			return nil
 		},
@@ -954,14 +1081,52 @@ func newEmbedCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			ok, err := embed.EnsureModel(embed.ModelsDir(cfg.DataDir))
+			if err := embed.EnsureReady(embed.ModelsDir(cfg.DataDir)); err != nil {
+				return err
+			}
+			fmt.Println("model ready:", embed.ModelName)
+			return nil
+		},
+	})
+	root.AddCommand(&cobra.Command{
+		Use:   "sync",
+		Short: "Process pending embed queue now",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			a, err := openApp()
 			if err != nil {
 				return err
 			}
-			if !ok {
-				return fmt.Errorf("model not ready")
+			defer a.close()
+			if err := embed.EnsureReady(embed.ModelsDir(a.cfg.DataDir)); err != nil {
+				return err
 			}
-			fmt.Println("model ready:", embed.ModelName)
+			ctx, cancel := withTimeout()
+			defer cancel()
+			pending, _ := embed.QueueStats(ctx, a.st.DB())
+			n, err := embed.ProcessQueue(ctx, a.st.DB(), embed.HashEmbedder{}, 500)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("embedded %d (was pending %d)\n", n, pending)
+			return nil
+		},
+	})
+	root.AddCommand(&cobra.Command{
+		Use:   "status",
+		Short: "Show embed queue size",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			a, err := openApp()
+			if err != nil {
+				return err
+			}
+			defer a.close()
+			ctx, cancel := withTimeout()
+			defer cancel()
+			n, err := embed.QueueStats(ctx, a.st.DB())
+			if err != nil {
+				return err
+			}
+			fmt.Printf("queue: %d  model: %v\n", n, embed.ModelReady(embed.ModelsDir(a.cfg.DataDir)))
 			return nil
 		},
 	})

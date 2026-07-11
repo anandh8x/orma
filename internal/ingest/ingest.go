@@ -2,6 +2,7 @@ package ingest
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -60,6 +61,14 @@ func (s *Service) IngestOne(ctx context.Context, raw []byte) (*Result, error) {
 	cmd := ""
 	if ev.Command != nil {
 		cmd = *ev.Command
+	}
+	// Fail fingerprints help Error->Fix linking when stderr is missing.
+	if ev.Outcome == "fail" && ev.StderrFingerprint == "" {
+		if ev.StderrExcerpt != "" {
+			ev.StderrFingerprint = fingerprint(ev.StderrExcerpt)
+		} else if cmd != "" {
+			ev.StderrFingerprint = fingerprint("cmd:" + cmd)
+		}
 	}
 	isNoise := noise.IsNoiseCommand(cmd, s.Config.NoiseCommands)
 
@@ -225,6 +234,11 @@ func redactString(s string) string {
 		}
 	}
 	return out
+}
+
+func fingerprint(s string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(s)))
+	return fmt.Sprintf("sha256:%x", sum[:16])
 }
 
 func redactKeyValue(s, key string) string {

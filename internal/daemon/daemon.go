@@ -84,61 +84,12 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-			_ = processEmbedQueue(ctx, st, emb)
+			_, _ = embed.ProcessQueue(ctx, st.DB(), emb, 50)
 			_, _ = dis.AutoDistillStale(ctx, 3*time.Minute)
 			for _, dir := range watchers {
 				_ = scanJSONLDir(ctx, st, cfg, dir, seen)
 			}
 		}
-	}
-}
-
-func processEmbedQueue(ctx context.Context, st *store.Store, emb embed.HashEmbedder) error {
-	rows, err := st.DB().QueryContext(ctx, `
-		SELECT id, ref_type, ref_id FROM embed_queue ORDER BY created_at ASC LIMIT 50`)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	type item struct{ id, refType, refID string }
-	var items []item
-	for rows.Next() {
-		var it item
-		if err := rows.Scan(&it.id, &it.refType, &it.refID); err != nil {
-			return err
-		}
-		items = append(items, it)
-	}
-	for _, it := range items {
-		text := loadText(ctx, st, it.refType, it.refID)
-		if text == "" {
-			_, _ = st.DB().ExecContext(ctx, `DELETE FROM embed_queue WHERE id = ?`, it.id)
-			continue
-		}
-		vec, err := emb.Embed(ctx, text)
-		if err != nil {
-			continue
-		}
-		if err := embed.SaveEmbedding(ctx, st.DB(), it.refType, it.refID, emb.Name(), vec); err != nil {
-			continue
-		}
-		_, _ = st.DB().ExecContext(ctx, `DELETE FROM embed_queue WHERE id = ?`, it.id)
-	}
-	return nil
-}
-
-func loadText(ctx context.Context, st *store.Store, refType, refID string) string {
-	switch refType {
-	case "workflow":
-		var body string
-		_ = st.DB().QueryRowContext(ctx, `SELECT COALESCE(body,'') FROM workflows WHERE id = ?`, refID).Scan(&body)
-		return body
-	case "note":
-		var text string
-		_ = st.DB().QueryRowContext(ctx, `SELECT text FROM notes WHERE id = ?`, refID).Scan(&text)
-		return text
-	default:
-		return ""
 	}
 }
 
