@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -25,6 +24,7 @@ import (
 	"github.com/anandh8x/orma/internal/history"
 	"github.com/anandh8x/orma/internal/ingest"
 	"github.com/anandh8x/orma/internal/project"
+	"github.com/anandh8x/orma/internal/shellembed"
 	"github.com/anandh8x/orma/internal/store"
 	"github.com/anandh8x/orma/internal/workflow"
 	"github.com/spf13/cobra"
@@ -107,7 +107,10 @@ func newInitCmd() *cobra.Command {
 			}
 
 			fmt.Println("init: ok")
-			fmt.Println(`add to shell: eval "$(orma hook zsh)"  # or bash`)
+			fmt.Printf("binary: %s\n", exePath())
+			fmt.Println("add one line to your shell rc, then open a new terminal:")
+			fmt.Println(`  eval "$(orma hook zsh)"`)
+			fmt.Println(`  # or: eval "$(orma hook bash)"`)
 			return nil
 		},
 	}
@@ -235,78 +238,18 @@ func newIngestCmd() *cobra.Command {
 func newHookCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "hook [zsh|bash]",
-		Short: "Print shell integration script",
+		Short: "Print shell integration script (hooks use this binary path)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			shell := args[0]
-			var name string
-			switch shell {
-			case "zsh":
-				name = "orma.zsh"
-			case "bash":
-				name = "orma.bash"
-			default:
-				return fmt.Errorf("unsupported shell %q (zsh|bash)", shell)
+			script, err := shellembed.Script(args[0], exePath())
+			if err != nil {
+				return err
 			}
-			// prefer installed share path next to binary, else embedded content via shell/
-			path := filepath.Join(filepath.Dir(exePath()), "..", "shell", name)
-			if b, err := os.ReadFile(path); err == nil {
-				os.Stdout.Write(b)
-				return nil
-			}
-			// fall back to repo-relative for dev
-			candidates := []string{
-				filepath.Join("shell", name),
-				filepath.Join(filepath.Dir(exePath()), "shell", name),
-			}
-			for _, c := range candidates {
-				if b, err := os.ReadFile(c); err == nil {
-					os.Stdout.Write(b)
-					return nil
-				}
-			}
-			// minimal inline fallback
-			if shell == "zsh" {
-				_, _ = os.Stdout.WriteString(minimalZsh)
-			} else {
-				_, _ = os.Stdout.WriteString(minimalBash)
-			}
-			return nil
+			_, err = os.Stdout.WriteString(script)
+			return err
 		},
 	}
 }
-
-const minimalZsh = `# orma zsh (minimal)
-_ORMA_BIN="${ORMA_BIN:-orma}"
-_ORMA_LAST_CMD=""
-_orma_preexec() { _ORMA_LAST_CMD="$1"; }
-_orma_precmd() {
-  local ec=$?
-  [[ -z "$_ORMA_LAST_CMD" ]] && return 0
-  local cmd="$_ORMA_LAST_CMD"; _ORMA_LAST_CMD=""
-  (printf '%s' "$cmd" | "$_ORMA_BIN" hook-capture --shell zsh --exit "$ec" --cwd "$PWD" &) >/dev/null 2>&1
-  ("$_ORMA_BIN" hook-exit --exit "$ec" &) >/dev/null 2>&1
-}
-autoload -Uz add-zsh-hook 2>/dev/null
-add-zsh-hook preexec _orma_preexec 2>/dev/null || preexec_functions+=(_orma_preexec)
-add-zsh-hook precmd _orma_precmd 2>/dev/null || precmd_functions+=(_orma_precmd)
-`
-
-const minimalBash = `# orma bash (minimal)
-_ORMA_BIN="${ORMA_BIN:-orma}"
-_ORMA_LAST_CMD=""
-_orma_preexec() { _ORMA_LAST_CMD="$BASH_COMMAND"; }
-_orma_prompt_command() {
-  local ec=$?
-  if [[ -n "$_ORMA_LAST_CMD" ]]; then
-    local cmd="$_ORMA_LAST_CMD"; _ORMA_LAST_CMD=""
-    (printf '%s' "$cmd" | "$_ORMA_BIN" hook-capture --shell bash --exit "$ec" --cwd "$PWD" &) >/dev/null 2>&1
-    ("$_ORMA_BIN" hook-exit --exit "$ec" &) >/dev/null 2>&1
-  fi
-}
-trap '_orma_preexec' DEBUG
-PROMPT_COMMAND="_orma_prompt_command${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
-`
 
 func newHookCaptureCmd() *cobra.Command {
 	var shell string
@@ -898,19 +841,26 @@ func newDaemonCmd() *cobra.Command {
 
 func startDaemonBackground(cfg *config.Config) error {
 	bin := exePath()
-	// detach
+	// detach from tty; inherit env so XDG paths stay consistent
 	attr := &os.ProcAttr{
-		Dir:   "/",
+		Dir:   cfg.DataDir,
 		Env:   os.Environ(),
-		Files: []*os.File{nil, nil, nil},
+		Files: []*os.File{os.Stdin, nil, nil},
 	}
 	p, err := os.StartProcess(bin, []string{bin, "daemon", "run"}, attr)
 	if err != nil {
-		// fallback: system orma
-		return fmt.Errorf("start daemon: %w", err)
+		return fmt.Errorf("start daemon: %w (binary %s)", err, bin)
 	}
 	_ = p.Release()
-	time.Sleep(100 * time.Millisecond)
+	// give pid file a moment
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if ok, _, _ := daemon.Status(cfg.DataDir); ok {
+			fmt.Println("daemon running")
+			return nil
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 	fmt.Println("daemon starting")
 	return nil
 }

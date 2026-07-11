@@ -1,12 +1,11 @@
-# Orma zsh integration (local operational memory)
-# Add: eval "$(orma hook zsh)"
+# Orma zsh integration
+# eval "$(orma hook zsh)"
 
-_ORMA_BIN="${ORMA_BIN:-orma}"
+_ORMA_BIN='__ORMA_BIN__'
 _ORMA_LAST_CMD=""
 
 _orma_preexec() {
   _ORMA_LAST_CMD="$1"
-  # auto-start daemon in background if missing
   if ! "$_ORMA_BIN" daemon status >/dev/null 2>&1; then
     ("$_ORMA_BIN" daemon start >/dev/null 2>&1 &)
   fi
@@ -17,12 +16,9 @@ _orma_precmd() {
   [[ -z "$_ORMA_LAST_CMD" ]] && return 0
   local cmd="$_ORMA_LAST_CMD"
   _ORMA_LAST_CMD=""
-  # never break the shell
   (
-    local payload
-    payload=$(printf '%s' "$cmd" | "$_ORMA_BIN" hook-capture --shell zsh --exit "$ec" --cwd "$PWD" 2>/dev/null) || true
+    printf '%s' "$cmd" | "$_ORMA_BIN" hook-capture --shell zsh --exit "$ec" --cwd "$PWD" 2>/dev/null || true
   ) >/dev/null 2>&1 &!
-  # step-through tracking
   ("$_ORMA_BIN" hook-exit --exit "$ec" >/dev/null 2>&1 &)
   return 0
 }
@@ -36,7 +32,6 @@ else
   precmd_functions+=(_orma_precmd)
 fi
 
-# Ctrl-G recall picker (rebind via ORMA_KEYBIND)
 _orma_widget() {
   local sel
   sel=$("$_ORMA_BIN" recall --pick 2>/dev/null) || return 0

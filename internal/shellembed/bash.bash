@@ -1,10 +1,8 @@
 # Orma bash integration
-# Add: eval "$(orma hook bash)"
+# eval "$(orma hook bash)"
 
-_ORMA_BIN="${ORMA_BIN:-orma}"
+_ORMA_BIN='__ORMA_BIN__'
 _ORMA_LAST_CMD=""
-
-_orma_debug() { :; }
 
 _orma_preexec() {
   _ORMA_LAST_CMD="$BASH_COMMAND"
@@ -27,13 +25,12 @@ _orma_prompt_command() {
 }
 
 trap '_orma_preexec' DEBUG
-if [[ -z "$PROMPT_COMMAND" ]]; then
+if [[ -z "${PROMPT_COMMAND:-}" ]]; then
   PROMPT_COMMAND="_orma_prompt_command"
 else
   PROMPT_COMMAND="_orma_prompt_command;${PROMPT_COMMAND}"
 fi
 
-# bash bind for recall (insert)
 bind -x "\"\C-g\":\"orma-recall-insert\"" 2>/dev/null || true
 orma-recall-insert() {
   local sel

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/anandh8x/orma/internal/config"
@@ -62,6 +63,9 @@ func exePath() string {
 	p, err := os.Executable()
 	if err != nil {
 		return "orma"
+	}
+	if resolved, err := filepath.EvalSymlinks(p); err == nil {
+		return resolved
 	}
 	return p
 }
