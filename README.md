@@ -1,6 +1,6 @@
-# Orma
+<h1 align="center">Orma</h1>
 
-**Local operational memory for your terminal and coding agents.**
+<p align="center"><strong>Local operational memory for your terminal and coding agents.</strong></p>
 
 *orma* means *memory* (Malayalam). Agents try things. Orma remembers what worked.
 
