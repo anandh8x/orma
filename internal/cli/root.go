@@ -6,8 +6,13 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// version is set at build time with -ldflags when we care.
-var version = "0.1.0-dev"
+// version stays "dev" in the source tree on purpose.
+// Do not bump it on normal commits. Releases set it once via:
+//
+//	go build -ldflags "-X github.com/anandh8x/orma/internal/cli.version=v1.2.3" ./cmd/orma
+//
+// Prefer git tags for product versions, not every PR.
+var version = "dev"
 
 // Execute runs the root command.
 func Execute() error {
