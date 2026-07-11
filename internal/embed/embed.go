@@ -16,8 +16,11 @@ import (
 // Dim is MiniLM embedding size.
 const Dim = 384
 
+// ONNXModelName is the embeddings.model id for MiniLM ONNX (when cgo build uses it).
+const ONNXModelName = "all-MiniLM-L6-v2-onnx-q"
+
 // ModelName is the preferred embeddings.model id when ONNX is active.
-// Kept for callers; prefer ActiveModelName(modelsDir).
+// Prefer ActiveModelName(modelsDir) at runtime.
 const ModelName = ONNXModelName
 
 // Embedder turns text into a fixed vector.
@@ -160,14 +163,13 @@ func ONNXReady(modelsDir string) bool {
 	return true
 }
 
-// Open returns the best available embedder (ONNX MiniLM preferred).
+// Open returns the best available embedder (ONNX MiniLM preferred when cgo is enabled).
 func Open(modelsDir string) (Embedder, error) {
 	if ONNXReady(modelsDir) {
-		m, err := NewMiniLMONNX(modelsDir)
-		if err == nil {
+		if m, err := openONNX(modelsDir); err == nil {
 			return m, nil
 		}
-		// fall through to hash if construct fails
+		// fall through to hash if onnx/cgo unavailable
 	}
 	return HashEmbedder{}, nil
 }

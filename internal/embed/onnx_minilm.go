@@ -1,3 +1,5 @@
+//go:build cgo
+
 package embed
 
 import (
@@ -7,9 +9,6 @@ import (
 
 	ort "github.com/yalue/onnxruntime_go"
 )
-
-// ONNXModelName is the stored embeddings.model value for MiniLM ONNX.
-const ONNXModelName = "all-MiniLM-L6-v2-onnx-q"
 
 // MiniLM ONNX session embedder (Hugging Face quantized model).
 type MiniLMONNX struct {
@@ -37,6 +36,11 @@ func initORT(libPath string) error {
 	// if a second path is requested and differs, still use first successful init
 	_ = ortLib
 	return nil
+}
+
+// openONNX builds the MiniLM ONNX embedder (cgo builds only).
+func openONNX(modelsDir string) (Embedder, error) {
+	return NewMiniLMONNX(modelsDir)
 }
 
 // NewMiniLMONNX builds an embedder. Call EnsureModel first.
