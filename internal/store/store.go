@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -13,9 +14,9 @@ import (
 
 // Store is the local SQLite memory.
 type Store struct {
-	db           *sql.DB
-	path         string
-	busyTimeout  time.Duration
+	db          *sql.DB
+	path        string
+	busyTimeout time.Duration
 }
 
 // Open opens or creates the database, enables WAL, migrates.
@@ -27,8 +28,9 @@ func Open(path string, busyTimeoutMS int) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	// One writer-friendly setup; still allow concurrent readers.
-	db.SetMaxOpenConns(1)
+	// Allow a few concurrent queries (scan + enrich). Writes still serialize via WAL.
+	db.SetMaxOpenConns(8)
+	db.SetMaxIdleConns(4)
 
 	s := &Store{
 		db:          db,
@@ -54,7 +56,7 @@ func (s *Store) pragma() error {
 	stmts := []string{
 		"PRAGMA foreign_keys = ON",
 		"PRAGMA journal_mode = WAL",
-		"PRAGMA busy_timeout = " + fmt.Sprintf("%d", int(s.busyTimeout.Milliseconds())),
+		fmt.Sprintf("PRAGMA busy_timeout = %d", int(s.busyTimeout.Milliseconds())),
 		"PRAGMA synchronous = NORMAL",
 	}
 	for _, q := range stmts {
@@ -66,59 +68,63 @@ func (s *Store) pragma() error {
 }
 
 func (s *Store) migrate() error {
-	var ver int
-	err := s.db.QueryRow(`SELECT value FROM meta WHERE key = 'schema_version'`).Scan(&ver)
-	if err != nil && err != sql.ErrNoRows {
-		// table may not exist yet
-		ver = 0
-	}
-	if err == sql.ErrNoRows {
-		ver = 0
-	}
-
-	// Detect missing meta table
-	var name string
-	err = s.db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='meta'`).Scan(&name)
-	if err == sql.ErrNoRows {
-		ver = 0
-	} else if err != nil {
-		// try create from scratch
-		ver = 0
-	}
+	ver := s.readSchemaVersion()
 
 	if ver >= schemaVersion {
 		return nil
 	}
 
-	// Backup existing db file before applying migrations when upgrading.
 	if ver > 0 {
 		if err := s.backup(); err != nil {
 			return fmt.Errorf("backup before migrate: %w", err)
 		}
 	}
 
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	// Apply all migrations from current to latest (v1 is full schema for now).
-	if ver < 1 {
-		if _, err := tx.Exec(migrations[0]); err != nil {
-			return fmt.Errorf("migrate v1: %w", err)
+	for v := ver + 1; v <= schemaVersion; v++ {
+		sqlText, ok := migrations[v]
+		if !ok {
+			return fmt.Errorf("missing migration for version %d", v)
+		}
+		tx, err := s.db.Begin()
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(sqlText); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("migrate v%d: %w", v, err)
+		}
+		if _, err := tx.Exec(
+			`INSERT INTO meta(key, value) VALUES('schema_version', ?)
+			 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+			fmt.Sprintf("%d", v),
+		); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+		if err := tx.Commit(); err != nil {
+			return err
 		}
 	}
 
-	if _, err := tx.Exec(
-		`INSERT INTO meta(key, value) VALUES('schema_version', ?)
-		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
-		fmt.Sprintf("%d", schemaVersion),
-	); err != nil {
-		return err
-	}
+	// Ensure body column exists on older workflow rows from partial installs.
+	_, _ = s.db.Exec(`ALTER TABLE workflows ADD COLUMN body TEXT`) // ignore if exists
+	return nil
+}
 
-	return tx.Commit()
+func (s *Store) readSchemaVersion() int {
+	var name string
+	err := s.db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='meta'`).Scan(&name)
+	if err != nil {
+		return 0
+	}
+	var v string
+	err = s.db.QueryRow(`SELECT value FROM meta WHERE key = 'schema_version'`).Scan(&v)
+	if err != nil {
+		return 0
+	}
+	var n int
+	_, _ = fmt.Sscanf(v, "%d", &n)
+	return n
 }
 
 func (s *Store) backup() error {
@@ -139,7 +145,7 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
-// DB exposes the underlying handle for packages in store (events, sessions).
+// DB exposes the underlying handle.
 func (s *Store) DB() *sql.DB {
 	return s.db
 }
@@ -149,7 +155,7 @@ func (s *Store) Path() string {
 	return s.path
 }
 
-// WithRetry runs fn, retrying on SQLITE_BUSY style errors.
+// WithRetry runs fn, retrying on busy/locked errors.
 func (s *Store) WithRetry(ctx context.Context, fn func(ctx context.Context) error) error {
 	deadline := time.Now().Add(s.busyTimeout)
 	var last error
@@ -176,20 +182,8 @@ func isBusy(err error) bool {
 	if err == nil {
 		return false
 	}
-	msg := err.Error()
-	return contains(msg, "busy") || contains(msg, "locked") || contains(msg, "SQLITE_BUSY")
-}
-
-func contains(s, sub string) bool {
-	return len(s) >= len(sub) && (s == sub || len(sub) == 0 ||
-		(func() bool {
-			for i := 0; i+len(sub) <= len(s); i++ {
-				if s[i:i+len(sub)] == sub {
-					return true
-				}
-			}
-			return false
-		})())
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "busy") || strings.Contains(msg, "locked")
 }
 
 // Ping checks the connection.
@@ -207,4 +201,25 @@ func (s *Store) SchemaVersion() (int, error) {
 	var n int
 	_, err = fmt.Sscanf(v, "%d", &n)
 	return n, err
+}
+
+// UpsertFTS indexes a memory document.
+func (s *Store) UpsertFTS(ctx context.Context, refType, refID, projectRoot, title, body string) error {
+	_, _ = s.db.ExecContext(ctx, `DELETE FROM memory_fts WHERE ref_type = ? AND ref_id = ?`, refType, refID)
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO memory_fts(body, ref_type, ref_id, project_root, title) VALUES (?,?,?,?,?)`,
+		body, refType, refID, projectRoot, title,
+	)
+	return err
+}
+
+// EnqueueEmbed queues a ref for background embedding.
+func (s *Store) EnqueueEmbed(ctx context.Context, refType, refID string) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO embed_queue(id, ref_type, ref_id, created_at)
+		VALUES (?,?,?,?)
+		ON CONFLICT(ref_type, ref_id) DO NOTHING`,
+		refType+":"+refID, refType, refID, time.Now().UTC().Format(time.RFC3339Nano),
+	)
+	return err
 }

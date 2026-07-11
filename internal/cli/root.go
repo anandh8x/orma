@@ -7,7 +7,7 @@ import (
 )
 
 // version is set at build time with -ldflags when we care.
-var version = "0.0.0-dev"
+var version = "0.1.0-dev"
 
 // Execute runs the root command.
 func Execute() error {
@@ -17,12 +17,7 @@ func Execute() error {
 		SilenceErrors: true,
 		SilenceUsage:  true,
 	}
-
-	root.AddCommand(newVersionCmd())
-	root.AddCommand(newDoctorCmd())
-	root.AddCommand(newIngestCmd())
-	root.AddCommand(newInitCmd())
-
+	registerAll(root)
 	return root.Execute()
 }
 
