@@ -20,6 +20,8 @@ func Execute() error {
 
 	root.AddCommand(newVersionCmd())
 	root.AddCommand(newDoctorCmd())
+	root.AddCommand(newIngestCmd())
+	root.AddCommand(newInitCmd())
 
 	return root.Execute()
 }
@@ -30,17 +32,6 @@ func newVersionCmd() *cobra.Command {
 		Short: "Print orma version",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			fmt.Println(version)
-			return nil
-		},
-	}
-}
-
-func newDoctorCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:   "doctor",
-		Short: "Check local setup (placeholder until store lands)",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			fmt.Println("orma doctor: ok (scaffold only, no store yet)")
 			return nil
 		},
 	}
