@@ -67,19 +67,24 @@ download_release() {
   local url="https://github.com/${REPO}/releases/download/${ver}/${asset}"
   local tmp
   tmp=$(mktemp -d)
-  trap 'rm -rf "$tmp"' RETURN
 
   echo "downloading ${url}"
   if ! curl -fsSL "$url" -o "${tmp}/${asset}"; then
+    rm -rf "$tmp"
     return 1
   fi
-  tar -xzf "${tmp}/${asset}" -C "$tmp"
+  if ! tar -xzf "${tmp}/${asset}" -C "$tmp"; then
+    rm -rf "$tmp"
+    return 1
+  fi
   if [[ ! -f "${tmp}/orma" ]]; then
     echo "archive missing orma binary" >&2
+    rm -rf "$tmp"
     return 1
   fi
   mkdir -p "$BINDIR"
   install -m 755 "${tmp}/orma" "${BINDIR}/orma"
+  rm -rf "$tmp"
   return 0
 }
 
