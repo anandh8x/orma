@@ -6,6 +6,8 @@
 
 Orma runs entirely on your machine. It turns shell activity and agent tool runs into searchable workflows, project rituals, and error→fix links. When you need a past solution again, it rewrites paths for your current directory and drops the right command into your prompt.
 
+> **Early stage.** This is a young project (v0.1). Expect rough edges, incomplete polish, and possible breaking changes as things settle. Feedback and issues are welcome.
+
 ---
 
 ## What it does
